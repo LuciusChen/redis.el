@@ -1,0 +1,43 @@
+#+title: redis.el
+
+=redis.el= is a small native Redis RESP client for Emacs Lisp.
+
+The public API is intentionally narrow:
+
+- =redis-connect=
+- =redis-command=
+- =redis-disconnect=
+- =redis-live-p=
+- =redis-decode-string=
+
+Bulk strings are returned as unibyte byte strings.  Decode them for display:
+
+#+begin_src emacs-lisp
+(let ((conn (redis-connect '(:host "127.0.0.1" :port 6379))))
+  (unwind-protect
+      (progn
+        (redis-command conn "SET" "message" "hello")
+        (redis-decode-string (redis-command conn "GET" "message")))
+    (redis-disconnect conn)))
+#+end_src
+
+Current scope:
+
+- RESP2 request/response.
+- One command at a time per connection.
+- TCP connections.
+- AUTH password and AUTH username/password.
+- SELECT by logical database number.
+- Structured =redis-error=, =redis-protocol-error=, =redis-timeout-error=, and
+  =redis-connection-error= conditions.
+
+Out of scope for now:
+
+- RESP3.
+- Cluster redirects.
+- Sentinel.
+- TLS.
+- Pub/sub loops.
+- Pipelining.
+- Transactions.
+- Stream consumer workflows.
