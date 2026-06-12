@@ -34,6 +34,32 @@
   (should-error (redis-parse-response "-WRONGTYPE bad type\r\n")
                 :type 'redis-error))
 
+(ert-deftest redis-test-read-response-consumes-error-before-signaling ()
+  "Connection reads should advance past Redis error replies."
+  (let* ((buffer (generate-new-buffer " *redis-test*"))
+         (process nil)
+         (conn nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (set-buffer-multibyte nil)
+            (insert "-ERR bad\r\n+OK\r\n"))
+          (setq process (make-pipe-process
+                         :name "redis-test"
+                         :buffer buffer
+                         :noquery t))
+          (process-put process 'redis-response-start
+                       (with-current-buffer buffer (point-min)))
+          (setq conn (make-redis-conn :process process))
+          (should-error (redis--read-response conn) :type 'redis-error)
+          (should (equal (redis--read-response conn) "OK"))
+          (with-current-buffer buffer
+            (should (= (buffer-size) 0))))
+      (when (processp process)
+        (delete-process process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest redis-test-incomplete-response-signals-protocol-error ()
   "Public parsing should reject incomplete responses."
   (should-error (redis-parse-response "$5\r\nhel")

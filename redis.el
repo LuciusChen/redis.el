@@ -133,6 +133,14 @@
 (defconst redis--incomplete (make-symbol "redis-incomplete")
   "Internal marker for incomplete RESP data.")
 
+(defconst redis--error-reply (make-symbol "redis-error-reply")
+  "Internal marker for Redis error replies.")
+
+(defun redis--error-reply-p (value)
+  "Return non-nil when VALUE is an internal Redis error reply."
+  (and (consp value)
+       (eq (car value) redis--error-reply)))
+
 (defun redis--decode-line (bytes)
   "Decode RESP line BYTES as UTF-8 text."
   (decode-coding-string bytes 'utf-8 t))
@@ -169,11 +177,13 @@ If BYTES is nil, return nil."
       (cons (redis--decode-line (car line)) (cdr line)))))
 
 (defun redis--parse-error (bytes start)
-  "Signal a Redis error parsed from BYTES at START."
+  "Return an internal Redis error reply parsed from BYTES at START."
   (let ((line (redis--parse-line-payload bytes start)))
     (if (eq line redis--incomplete)
         redis--incomplete
-      (signal 'redis-error (list (redis--decode-line (car line)))))))
+      (cons (cons redis--error-reply
+                  (redis--decode-line (car line)))
+            (cdr line)))))
 
 (defun redis--parse-bulk-string (bytes start)
   "Return (VALUE . NEXT) for a RESP bulk string in BYTES from START."
@@ -242,6 +252,8 @@ Return a cons cell (VALUE . CONSUMED-BYTES).  Signal
                    bytes))))
     (if (eq parsed redis--incomplete)
         (signal 'redis-protocol-error (list "Incomplete Redis response"))
+      (when (redis--error-reply-p (car parsed))
+        (signal 'redis-error (list (cdr (car parsed)))))
       parsed)))
 
 ;;;; Command execution
@@ -250,6 +262,12 @@ Return a cons cell (VALUE . CONSUMED-BYTES).  Signal
   "Return process buffer bytes from START for PROCESS."
   (with-current-buffer (process-buffer process)
     (buffer-substring-no-properties start (point-max))))
+
+(defun redis--discard-response-bytes (process end)
+  "Delete consumed response bytes through END from PROCESS buffer."
+  (with-current-buffer (process-buffer process)
+    (delete-region (point-min) end)
+    (process-put process 'redis-response-start (point-min))))
 
 (defun redis--read-response (conn)
   "Read one Redis response for CONN."
@@ -272,9 +290,11 @@ Return a cons cell (VALUE . CONSUMED-BYTES).  Signal
              (next (redis--parse-response bytes 0)))
         (unless (eq next redis--incomplete)
           (setq parsed next)
-          (process-put process 'redis-response-start
-                       (+ start (cdr next))))))
-    (car parsed)))
+          (redis--discard-response-bytes process (+ start (cdr next))))))
+    (let ((value (car parsed)))
+      (if (redis--error-reply-p value)
+          (signal 'redis-error (list (cdr value)))
+        value))))
 
 (defun redis-command (conn command &rest arguments)
   "Send COMMAND with ARGUMENTS on CONN and return the Redis response.
