@@ -32,6 +32,8 @@
 (ert-deftest redis-test-error-response-signals-redis-error ()
   "RESP error replies should not be ordinary values."
   (should-error (redis-parse-response "-WRONGTYPE bad type\r\n")
+                :type 'redis-error)
+  (should-error (redis-parse-response "*1\r\n-ERR nested\r\n")
                 :type 'redis-error))
 
 (ert-deftest redis-test-read-response-consumes-error-before-signaling ()
@@ -64,6 +66,92 @@
   "Public parsing should reject incomplete responses."
   (should-error (redis-parse-response "$5\r\nhel")
                 :type 'redis-protocol-error))
+
+(ert-deftest redis-test-malformed-numbers-signal-protocol-error ()
+  "RESP integers and lengths should use strict decimal syntax."
+  (dolist (response '(":wat\r\n" "$wat\r\n\r\n" "*wat\r\n"))
+    (should-error (redis-parse-response response)
+                  :type 'redis-protocol-error)))
+
+(ert-deftest redis-test-timeout-invalidates-connection ()
+  "A response timeout should close the connection before it can be reused."
+  (let* ((redis-response-timeout 0)
+         (buffer (generate-new-buffer " *redis-test-timeout*"))
+         (process (make-pipe-process :name "redis-test-timeout"
+                                     :buffer buffer :noquery t))
+         (conn (make-redis-conn :process process)))
+    (cl-letf (((symbol-function 'process-send-string) #'ignore))
+      (should-error (redis-command conn "PING")
+                    :type 'redis-timeout-error))
+    (should (redis-conn-closed conn))
+    (should-not (redis-live-p conn))
+    (should-not (buffer-live-p buffer))))
+
+(ert-deftest redis-test-protocol-error-invalidates-connection ()
+  "A malformed server response should close the connection."
+  (let* ((buffer (generate-new-buffer " *redis-test-protocol-error*"))
+         (process (make-pipe-process :name "redis-test-protocol-error"
+                                     :buffer buffer :noquery t))
+         (conn (make-redis-conn :process process)))
+    (with-current-buffer buffer
+      (set-buffer-multibyte nil)
+      (insert "?bad\r\n"))
+    (cl-letf (((symbol-function 'process-send-string) #'ignore))
+      (should-error (redis-command conn "PING")
+                    :type 'redis-protocol-error))
+    (should (redis-conn-closed conn))
+    (should-not (buffer-live-p buffer))))
+
+(ert-deftest redis-test-server-error-keeps-connection-live ()
+  "A consumed Redis error reply should not invalidate the connection."
+  (let* ((buffer (generate-new-buffer " *redis-test-server-error*"))
+         (process (make-pipe-process :name "redis-test-server-error"
+                                     :buffer buffer :noquery t))
+         (conn (make-redis-conn :process process)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (set-buffer-multibyte nil)
+            (insert "-ERR bad\r\n"))
+          (cl-letf (((symbol-function 'process-send-string) #'ignore))
+            (should-error (redis-command conn "PING") :type 'redis-error))
+          (should (redis-live-p conn))
+          (should-not (redis-conn-closed conn)))
+      (redis-disconnect conn))))
+
+(ert-deftest redis-test-local-encoding-error-keeps-connection-live ()
+  "Invalid local command arguments should not invalidate the connection."
+  (let* ((buffer (generate-new-buffer " *redis-test-encode-error*"))
+         (process (make-pipe-process :name "redis-test-encode-error"
+                                     :buffer buffer :noquery t))
+         (conn (make-redis-conn :process process)))
+    (unwind-protect
+        (progn
+          (should-error (redis-command conn "SET" '(unsupported))
+                        :type 'redis-protocol-error)
+          (should (redis-live-p conn))
+          (should-not (redis-conn-closed conn)))
+      (redis-disconnect conn))))
+
+(ert-deftest redis-test-connect-authenticates-and-selects-database ()
+  "Connection setup should issue AUTH before SELECT."
+  (let (calls conn)
+    (cl-letf (((symbol-function 'make-network-process)
+               (lambda (&rest args)
+                 (make-pipe-process :name "redis-test-connect"
+                                    :buffer (plist-get args :buffer)
+                                    :noquery t)))
+              ((symbol-function 'redis-command)
+               (lambda (_conn command &rest arguments)
+                 (push (cons command arguments) calls)
+                 "OK")))
+      (unwind-protect
+          (setq conn (redis-connect '(:host "db" :port 6379
+                                      :user "app" :password "secret"
+                                      :database 2)))
+        (when conn (redis-disconnect conn))))
+    (should (equal (nreverse calls)
+                   '(("AUTH" "app" "secret") ("SELECT" 2))))))
 
 (ert-deftest redis-test-live-basic-commands ()
   "Basic command path should work against a live Redis server."

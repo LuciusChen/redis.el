@@ -141,6 +141,14 @@
   (and (consp value)
        (eq (car value) redis--error-reply)))
 
+(defun redis--error-reply-message (value)
+  "Return the first Redis error message nested in VALUE."
+  (cond
+   ((redis--error-reply-p value) (cdr value))
+   ((listp value)
+    (cl-loop for item in value
+             thereis (redis--error-reply-message item)))))
+
 (defun redis--decode-line (bytes)
   "Decode RESP line BYTES as UTF-8 text."
   (decode-coding-string bytes 'utf-8 t))
@@ -167,7 +175,12 @@ If BYTES is nil, return nil."
   (let ((line (redis--parse-line-payload bytes start)))
     (if (eq line redis--incomplete)
         redis--incomplete
-      (cons (string-to-number (car line)) (cdr line)))))
+      (let ((payload (car line)))
+        (unless (string-match-p "\\`-?[0-9]+\\'" payload)
+          (signal 'redis-protocol-error
+                  (list (format "Invalid Redis integer: %S"
+                                (redis--decode-line payload)))))
+        (cons (string-to-number payload) (cdr line))))))
 
 (defun redis--parse-simple-string (bytes start)
   "Return (VALUE . NEXT) for a RESP simple string in BYTES from START."
@@ -252,8 +265,8 @@ Return a cons cell (VALUE . CONSUMED-BYTES).  Signal
                    bytes))))
     (if (eq parsed redis--incomplete)
         (signal 'redis-protocol-error (list "Incomplete Redis response"))
-      (when (redis--error-reply-p (car parsed))
-        (signal 'redis-error (list (cdr (car parsed)))))
+      (when-let* ((message (redis--error-reply-message (car parsed))))
+        (signal 'redis-error (list message)))
       parsed)))
 
 ;;;; Command execution
@@ -274,27 +287,26 @@ Return a cons cell (VALUE . CONSUMED-BYTES).  Signal
   (let* ((process (redis-conn-process conn))
          (deadline (+ (float-time) redis-response-timeout))
          parsed)
-    (redis--ensure-live conn)
     (while (not parsed)
-      (let ((remaining (- deadline (float-time))))
-        (when (<= remaining 0)
-          (signal 'redis-timeout-error
-                  (list (format "Redis response timed out after %.3f seconds"
-                                redis-response-timeout))))
-        (accept-process-output process (min remaining 0.05) nil t))
-      (redis--ensure-live conn)
       (let* ((start (or (process-get process 'redis-response-start)
                         (with-current-buffer (process-buffer process)
                           (point-min))))
              (bytes (redis--response-bytes process start))
              (next (redis--parse-response bytes 0)))
-        (unless (eq next redis--incomplete)
+        (if (eq next redis--incomplete)
+            (let ((remaining (- deadline (float-time))))
+              (redis--ensure-live conn)
+              (when (<= remaining 0)
+                (signal 'redis-timeout-error
+                        (list (format "Redis response timed out after %.3f seconds"
+                                      redis-response-timeout))))
+              (accept-process-output process (min remaining 0.05) nil t))
           (setq parsed next)
           (redis--discard-response-bytes process (+ start (cdr next))))))
     (let ((value (car parsed)))
-      (if (redis--error-reply-p value)
-          (signal 'redis-error (list (cdr value)))
-        value))))
+      (when-let* ((message (redis--error-reply-message value)))
+        (signal 'redis-error (list message)))
+      value)))
 
 (defun redis-command (conn command &rest arguments)
   "Send COMMAND with ARGUMENTS on CONN and return the Redis response.
@@ -304,14 +316,23 @@ unibyte byte strings."
   (when (redis-conn-busy conn)
     (signal 'redis-connection-error
             (list "Redis connection is already running a command")))
-  (setf (redis-conn-busy conn) t)
-  (unwind-protect
-      (progn
-        (process-send-string
-         (redis-conn-process conn)
-         (apply #'redis-encode-command command arguments))
-        (redis--read-response conn))
-    (setf (redis-conn-busy conn) nil)))
+  (let ((payload (apply #'redis-encode-command command arguments)))
+    (setf (redis-conn-busy conn) t)
+    (unwind-protect
+        (condition-case err
+            (progn
+              (process-send-string (redis-conn-process conn) payload)
+              (redis--read-response conn))
+          ((redis-timeout-error redis-protocol-error redis-connection-error)
+           (redis-disconnect conn)
+           (signal (car err) (cdr err)))
+          (redis-error
+           (signal (car err) (cdr err)))
+          (error
+           (redis-disconnect conn)
+           (signal 'redis-connection-error
+                   (list (error-message-string err)))))
+      (setf (redis-conn-busy conn) nil))))
 
 (defun redis--maybe-authenticate (conn params)
   "Authenticate CONN when PARAMS include a password."

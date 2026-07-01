@@ -30,6 +30,8 @@ Current scope:
 - SELECT by logical database number.
 - Structured =redis-error=, =redis-protocol-error=, =redis-timeout-error=, and
   =redis-connection-error= conditions.
+- Response timeouts, malformed protocol replies, and transport failures close
+  the connection so a delayed reply cannot be mistaken for a later command.
 
 Out of scope for now:
 
