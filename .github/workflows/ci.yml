@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  elisp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: "29.1"
+      - name: Run ERT suite
+        run: emacs -Q --batch -L . -l ert -l test/redis-test.el --eval '(ert-run-tests-batch-and-exit)'

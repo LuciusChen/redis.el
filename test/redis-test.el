@@ -139,7 +139,8 @@
          (process (make-pipe-process :name "redis-test-fragmented"
                                      :buffer buffer :noquery t))
          (conn (make-redis-conn :process process))
-         (chunks (list "bar\r\n")))
+         (chunks (list "bar\r\n"))
+         scan-states)
     (unwind-protect
         (progn
           (with-current-buffer buffer
@@ -147,14 +148,23 @@
             (insert "*2\r\n$3\r\nfoo\r\n$3\r\n"))
           (process-put process 'redis-response-start
                        (with-current-buffer buffer (point-min)))
-          (cl-letf (((symbol-function 'accept-process-output)
-                     (lambda (&rest _)
-                       (with-current-buffer buffer
-                         (goto-char (point-max))
-                         (insert (pop chunks)))
-                       t)))
-            (should (equal (redis--read-response conn) '("foo" "bar"))))
+          (let ((original-scan (symbol-function 'redis--scan-available)))
+            (cl-letf (((symbol-function 'redis--scan-available)
+                       (lambda (state)
+                         (push state scan-states)
+                         (funcall original-scan state)))
+                      ((symbol-function 'accept-process-output)
+                       (lambda (&rest _)
+                         (with-current-buffer buffer
+                           (goto-char (point-max))
+                           (insert (pop chunks)))
+                         t)))
+              (should (equal (redis--read-response conn) '("foo" "bar")))))
           (should-not chunks)
+          (should (> (length scan-states) 1))
+          (let ((state (car scan-states)))
+            (dolist (seen scan-states)
+              (should (eq seen state))))
           (with-current-buffer buffer
             (should (= (buffer-size) 0))))
       (redis-disconnect conn))))
