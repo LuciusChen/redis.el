@@ -6,7 +6,7 @@
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Assisted-by: OpenAI Codex:gpt-5.5
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
-;; Version: 0.1.0
+;; Version: 0.1.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: data, redis, tools
 ;; URL: https://github.com/LuciusChen/redis.el
@@ -43,6 +43,31 @@
 (defcustom redis-response-timeout 3
   "Seconds to wait for one Redis response."
   :type 'number
+  :group 'redis)
+
+(defcustom redis-connect-timeout 3
+  "Seconds to wait for a Redis TCP connection to open."
+  :type 'number
+  :group 'redis)
+
+(defcustom redis-max-response-bytes (* 64 1024 1024)
+  "Maximum bytes accepted in one RESP response."
+  :type 'integer
+  :group 'redis)
+
+(defcustom redis-max-bulk-bytes (* 32 1024 1024)
+  "Maximum bytes accepted in one RESP bulk string."
+  :type 'integer
+  :group 'redis)
+
+(defcustom redis-max-elements 1000000
+  "Maximum total declared array elements in one RESP response."
+  :type 'integer
+  :group 'redis)
+
+(defcustom redis-max-depth 128
+  "Maximum nested RESP array depth."
+  :type 'integer
   :group 'redis)
 
 (defcustom redis-default-host "127.0.0.1"
@@ -136,6 +161,12 @@
 (defconst redis--error-reply (make-symbol "redis-error-reply")
   "Internal marker for Redis error replies.")
 
+(defconst redis--int64-min (- (expt 2 63))
+  "Minimum RESP signed integer value.")
+
+(defconst redis--int64-max (1- (expt 2 63))
+  "Maximum RESP signed integer value.")
+
 (defun redis--error-reply-p (value)
   "Return non-nil when VALUE is an internal Redis error reply."
   (and (consp value)
@@ -170,17 +201,23 @@ If BYTES is nil, return nil."
             (+ line-end 2))
     redis--incomplete))
 
+(defun redis--parse-integer-token (payload)
+  "Return signed 64-bit integer encoded by RESP PAYLOAD."
+  (unless (and (<= (length payload) 20)
+               (string-match-p "\\`-?[0-9]+\\'" payload))
+    (signal 'redis-protocol-error (list "Invalid Redis integer token")))
+  (let ((value (string-to-number payload)))
+    (unless (<= redis--int64-min value redis--int64-max)
+      (signal 'redis-protocol-error (list "Redis integer is outside signed 64-bit range")))
+    value))
+
 (defun redis--parse-number-line (bytes start)
   "Return (NUMBER . NEXT) for a RESP integer-like line in BYTES from START."
   (let ((line (redis--parse-line-payload bytes start)))
     (if (eq line redis--incomplete)
         redis--incomplete
       (let ((payload (car line)))
-        (unless (string-match-p "\\`-?[0-9]+\\'" payload)
-          (signal 'redis-protocol-error
-                  (list (format "Invalid Redis integer: %S"
-                                (redis--decode-line payload)))))
-        (cons (string-to-number payload) (cdr line))))))
+        (cons (redis--parse-integer-token payload) (cdr line))))))
 
 (defun redis--parse-simple-string (bytes start)
   "Return (VALUE . NEXT) for a RESP simple string in BYTES from START."
@@ -211,6 +248,10 @@ If BYTES is nil, return nil."
          ((< size -1)
           (signal 'redis-protocol-error
                   (list (format "Invalid Redis bulk string length: %d" size))))
+         ((> size redis-max-bulk-bytes)
+          (signal 'redis-protocol-error
+                  (list (format "Redis bulk string exceeds %d-byte limit"
+                                redis-max-bulk-bytes))))
          ((> message-end (length bytes)) redis--incomplete)
          ((not (and (= (aref bytes body-end) ?\r)
                     (= (aref bytes (1+ body-end)) ?\n)))
@@ -219,8 +260,12 @@ If BYTES is nil, return nil."
          (t
           (cons (substring bytes body-start body-end) message-end)))))))
 
-(defun redis--parse-array (bytes start)
-  "Return (VALUE . NEXT) for a RESP array in BYTES from START."
+(defvar redis--parse-element-count 0
+  "Element counter dynamically bound while parsing one response.")
+
+(defun redis--parse-array (bytes start depth)
+  "Return (VALUE . NEXT) for a RESP array in BYTES from START.
+DEPTH is the number of containing arrays."
   (let ((length-line (redis--parse-number-line bytes start)))
     (if (eq length-line redis--incomplete)
         redis--incomplete
@@ -231,18 +276,28 @@ If BYTES is nil, return nil."
           (signal 'redis-protocol-error
                   (list (format "Invalid Redis array length: %d" size))))
          (t
+          (when (> (1+ depth) redis-max-depth)
+            (signal 'redis-protocol-error
+                    (list (format "Redis response exceeds depth limit %d"
+                                  redis-max-depth))))
+          (cl-incf redis--parse-element-count size)
+          (when (> redis--parse-element-count redis-max-elements)
+            (signal 'redis-protocol-error
+                    (list (format "Redis response exceeds %d-element limit"
+                                  redis-max-elements))))
           (cl-loop repeat size
-                   for parsed = (redis--parse-response bytes pos)
+                   for parsed = (redis--parse-response bytes pos (1+ depth))
                    when (eq parsed redis--incomplete)
                    return redis--incomplete
                    collect (car parsed) into values
                    do (setq pos (cdr parsed))
                    finally return (cons values pos))))))))
 
-(defun redis--parse-response (bytes &optional start)
+(defun redis--parse-response (bytes &optional start depth)
   "Return (VALUE . NEXT) for one RESP response in BYTES.
-START is a zero-based byte offset."
-  (let ((start (or start 0)))
+START is a zero-based byte offset.  DEPTH is the containing array depth."
+  (let ((start (or start 0))
+        (depth (or depth 0)))
     (if (>= start (length bytes))
         redis--incomplete
       (pcase (aref bytes start)
@@ -250,7 +305,7 @@ START is a zero-based byte offset."
         (?- (redis--parse-error bytes start))
         (?: (redis--parse-number-line bytes start))
         (?$ (redis--parse-bulk-string bytes start))
-        (?* (redis--parse-array bytes start))
+        (?* (redis--parse-array bytes start depth))
         (prefix
          (signal 'redis-protocol-error
                  (list (format "Unknown Redis response prefix: %c" prefix))))))))
@@ -259,22 +314,169 @@ START is a zero-based byte offset."
   "Parse one complete RESP response from BYTES.
 Return a cons cell (VALUE . CONSUMED-BYTES).  Signal
 `redis-protocol-error' when BYTES do not contain one complete response."
-  (let ((parsed (redis--parse-response
-                 (if (multibyte-string-p bytes)
-                     (encode-coding-string bytes 'binary t)
-                   bytes))))
+  (let* ((wire-bytes (if (multibyte-string-p bytes)
+                         (encode-coding-string bytes 'binary t)
+                       bytes))
+         (truncated (> (length wire-bytes) redis-max-response-bytes))
+         (parse-bytes (if truncated
+                          (substring wire-bytes 0
+                                     (min (length wire-bytes)
+                                          (1+ redis-max-response-bytes)))
+                        wire-bytes))
+         (redis--parse-element-count 0)
+         (parsed (redis--parse-response parse-bytes)))
     (if (eq parsed redis--incomplete)
-        (signal 'redis-protocol-error (list "Incomplete Redis response"))
+        (signal 'redis-protocol-error
+                (list (if truncated
+                          (format "Redis response exceeds %d-byte limit"
+                                  redis-max-response-bytes)
+                        "Incomplete Redis response")))
+      (when (> (cdr parsed) redis-max-response-bytes)
+        (signal 'redis-protocol-error
+                (list (format "Redis response exceeds %d-byte limit"
+                              redis-max-response-bytes))))
       (when-let* ((message (redis--error-reply-message (car parsed))))
         (signal 'redis-error (list message)))
       parsed)))
 
 ;;;; Command execution
 
-(defun redis--response-bytes (process start)
-  "Return process buffer bytes from START for PROCESS."
-  (with-current-buffer (process-buffer process)
-    (buffer-substring-no-properties start (point-max))))
+(cl-defstruct (redis--scan-state
+               (:constructor redis--make-scan-state))
+  "Incremental RESP envelope scan state."
+  pos
+  stack
+  line-search
+  (elements 0)
+  complete)
+
+(defun redis--scan-line (start &optional state)
+  "Return (PAYLOAD . NEXT) for a complete buffer line at START.
+When STATE is non-nil, resume searching after the previously scanned bytes."
+  (save-excursion
+    (goto-char (or (and state (redis--scan-state-line-search state))
+                   (1+ start)))
+    (if (search-forward "\r\n" nil t)
+        (progn
+          (when state (setf (redis--scan-state-line-search state) nil))
+          (cons (buffer-substring-no-properties (1+ start) (- (point) 2))
+                (point)))
+      (when state
+        ;; Recheck one byte so a CR/LF split across chunks is recognized.
+        (setf (redis--scan-state-line-search state)
+              (max (1+ start) (1- (point-max)))))
+      nil)))
+
+(defun redis--scan-number-line (start &optional state)
+  "Return (NUMBER . NEXT) for a complete numeric line at START.
+STATE, when non-nil, preserves incremental line scan progress."
+  (when-let* ((line (redis--scan-line start state)))
+    (cons (redis--parse-integer-token (car line)) (cdr line))))
+
+(defun redis--process-sentinel (process event)
+  "Record Redis PROCESS termination EVENT without changing its wire buffer."
+  (unless (redis--process-live-p process)
+    (process-put process 'redis-error (string-trim event))))
+
+(defun redis--scan-complete-value (state next)
+  "Record one complete value ending at NEXT in scan STATE."
+  (setf (redis--scan-state-pos state) next)
+  (let ((propagate t))
+    (while propagate
+      (if-let* ((stack (redis--scan-state-stack state)))
+          (let ((remaining (1- (car stack))))
+            (if (> remaining 0)
+                (progn
+                  (setcar stack remaining)
+                  (setq propagate nil))
+              (setf (redis--scan-state-stack state) (cdr stack))))
+        (setf (redis--scan-state-complete state) next)
+        (setq propagate nil)))))
+
+(defun redis--scan-available (state)
+  "Incrementally scan available bytes in current buffer using STATE.
+Return the absolute end position when one complete response is available."
+  (cl-block scan
+    (while (and (not (redis--scan-state-complete state))
+                (< (redis--scan-state-pos state) (point-max)))
+      (let* ((start (redis--scan-state-pos state))
+             (prefix (char-after start)))
+        (pcase prefix
+        ((or ?+ ?- ?:)
+         (if-let* ((line (if (= prefix ?:)
+                             (redis--scan-number-line start state)
+                           (redis--scan-line start state))))
+             (redis--scan-complete-value state (cdr line))
+           (cl-return-from scan nil)))
+        (?$
+         (if-let* ((line (redis--scan-number-line start state)))
+             (pcase-let* ((`(,size . ,body-start) line)
+                          (body-end (+ body-start size))
+                          (message-end (+ body-end 2)))
+               (cond
+                ((= size -1)
+                 (redis--scan-complete-value state body-start))
+                ((< size -1)
+                 (signal 'redis-protocol-error
+                         (list (format "Invalid Redis bulk string length: %d"
+                                       size))))
+                ((> size redis-max-bulk-bytes)
+                 (signal 'redis-protocol-error
+                         (list (format "Redis bulk string exceeds %d-byte limit"
+                                       redis-max-bulk-bytes))))
+                ((> message-end (point-max)) (cl-return-from scan nil))
+                ((not (and (= (char-after body-end) ?\r)
+                           (= (char-after (1+ body-end)) ?\n)))
+                 (signal 'redis-protocol-error
+                         (list "Redis bulk string is not terminated by CRLF")))
+                (t (redis--scan-complete-value state message-end))))
+           (cl-return-from scan nil)))
+        (?*
+         (if-let* ((line (redis--scan-number-line start state)))
+             (pcase-let ((`(,size . ,next) line))
+               (cond
+                ((= size -1) (redis--scan-complete-value state next))
+                ((< size -1)
+                 (signal 'redis-protocol-error
+                         (list (format "Invalid Redis array length: %d" size))))
+                ((= size 0) (redis--scan-complete-value state next))
+                (t
+                 (cl-incf (redis--scan-state-elements state) size)
+                 (when (> (redis--scan-state-elements state) redis-max-elements)
+                   (signal 'redis-protocol-error
+                           (list (format "Redis response exceeds %d-element limit"
+                                         redis-max-elements))))
+                 (when (>= (length (redis--scan-state-stack state))
+                           redis-max-depth)
+                   (signal 'redis-protocol-error
+                           (list (format "Redis response exceeds depth limit %d"
+                                         redis-max-depth))))
+                 (setf (redis--scan-state-pos state) next)
+                 (push size (redis--scan-state-stack state)))))
+           (cl-return-from scan nil)))
+        (_
+         (signal 'redis-protocol-error
+                 (list (format "Unknown Redis response prefix: %c" prefix))))))))
+  (redis--scan-state-complete state))
+
+(defun redis--wait-for-connect (process)
+  "Wait until PROCESS opens, bounded by `redis-connect-timeout'."
+  (let ((deadline (+ (float-time) redis-connect-timeout)))
+    (while (eq (process-status process) 'connect)
+      (let ((remaining (- deadline (float-time))))
+        (when (<= remaining 0)
+          (signal 'redis-connection-error
+                  (list (format "Redis connection timed out after %.3f seconds"
+                                redis-connect-timeout))))
+        ;; On macOS, restricting output to an asynchronous network process can
+        ;; prevent its connect event from being dispatched at all.
+        (accept-process-output nil (min remaining 0.05))))
+    (unless (redis--process-live-p process)
+      (signal 'redis-connection-error
+              (list (format "Redis connection failed: %s"
+                            (string-trim
+                             (format "%s" (or (process-get process 'redis-error)
+                                               (process-status process))))))))))
 
 (defun redis--discard-response-bytes (process end)
   "Delete consumed response bytes through END from PROCESS buffer."
@@ -285,25 +487,37 @@ Return a cons cell (VALUE . CONSUMED-BYTES).  Signal
 (defun redis--read-response (conn)
   "Read one Redis response for CONN."
   (let* ((process (redis-conn-process conn))
+         (buffer (process-buffer process))
+         (start (or (process-get process 'redis-response-start)
+                    (with-current-buffer buffer (point-min))))
+         (state (redis--make-scan-state :pos start))
          (deadline (+ (float-time) redis-response-timeout))
-         parsed)
-    (while (not parsed)
-      (let* ((start (or (process-get process 'redis-response-start)
-                        (with-current-buffer (process-buffer process)
-                          (point-min))))
-             (bytes (redis--response-bytes process start))
-             (next (redis--parse-response bytes 0)))
-        (if (eq next redis--incomplete)
-            (let ((remaining (- deadline (float-time))))
-              (redis--ensure-live conn)
-              (when (<= remaining 0)
-                (signal 'redis-timeout-error
-                        (list (format "Redis response timed out after %.3f seconds"
-                                      redis-response-timeout))))
-              (accept-process-output process (min remaining 0.05) nil t))
-          (setq parsed next)
-          (redis--discard-response-bytes process (+ start (cdr next))))))
-    (let ((value (car parsed)))
+         end)
+    (while (not end)
+      (setq end
+            (with-current-buffer buffer
+              (when (> (- (point-max) start) redis-max-response-bytes)
+                (signal 'redis-protocol-error
+                        (list (format "Redis response exceeds %d-byte limit"
+                                      redis-max-response-bytes))))
+              (redis--scan-available state)))
+      (unless end
+        (let ((remaining (- deadline (float-time))))
+          (redis--ensure-live conn)
+          (when (<= remaining 0)
+            (signal 'redis-timeout-error
+                    (list (format "Redis response timed out after %.3f seconds"
+                                  redis-response-timeout))))
+          (accept-process-output process (min remaining 0.05) nil t))))
+    (let* ((bytes (with-current-buffer buffer
+                    (buffer-substring-no-properties start end)))
+           (redis--parse-element-count 0)
+           (parsed (redis--parse-response bytes))
+           (value (car parsed)))
+      (unless (= (cdr parsed) (length bytes))
+        (signal 'redis-protocol-error
+                (list "Redis response envelope length mismatch")))
+      (redis--discard-response-bytes process end)
       (when-let* ((message (redis--error-reply-message value)))
         (signal 'redis-error (list message)))
       value)))
@@ -327,6 +541,9 @@ unibyte byte strings."
            (redis-disconnect conn)
            (signal (car err) (cdr err)))
           (redis-error
+           (signal (car err) (cdr err)))
+          (quit
+           (redis-disconnect conn)
            (signal (car err) (cdr err)))
           (error
            (redis-disconnect conn)
@@ -353,18 +570,25 @@ PARAMS is a plist supporting :host, :port, :user, :password, and :database."
   (let* ((host (or (plist-get params :host) redis-default-host))
          (port (or (plist-get params :port) redis-default-port))
          (buffer (redis--make-buffer host port))
+         process
          conn)
     (condition-case err
-        (let ((process (make-network-process
-                        :name (redis--buffer-name host port)
-                        :buffer buffer
-                        :host host
-                        :service port
-                        :nowait nil
-                        :noquery t
-                        :coding 'binary)))
+        (progn
+          (setq process
+                (make-network-process
+                 :name (redis--buffer-name host port)
+                 :buffer buffer
+                 :host host
+                 :service port
+                 :nowait t
+                 :noquery t
+                 :coding 'binary))
           (set-process-query-on-exit-flag process nil)
           (set-process-coding-system process 'binary 'binary)
+          (redis--wait-for-connect process)
+          ;; Keep connection establishment separate from protocol handling:
+          ;; install the wire-safe sentinel before any Redis command is sent.
+          (set-process-sentinel process #'redis--process-sentinel)
           (process-put process 'redis-response-start
                        (with-current-buffer buffer (point-min)))
           (setq conn (make-redis-conn
@@ -378,11 +602,21 @@ PARAMS is a plist supporting :host, :port, :user, :password, and :database."
           conn)
       (redis-error
        (when conn (redis-disconnect conn))
-       (unless conn (kill-buffer buffer))
+       (unless conn
+         (when (processp process) (delete-process process))
+         (when (buffer-live-p buffer) (kill-buffer buffer)))
+       (signal (car err) (cdr err)))
+      (quit
+       (when conn (redis-disconnect conn))
+       (unless conn
+         (when (processp process) (delete-process process))
+         (when (buffer-live-p buffer) (kill-buffer buffer)))
        (signal (car err) (cdr err)))
       (error
        (when conn (redis-disconnect conn))
-       (unless conn (kill-buffer buffer))
+       (unless conn
+         (when (processp process) (delete-process process))
+         (when (buffer-live-p buffer) (kill-buffer buffer)))
        (signal 'redis-connection-error
                (list (error-message-string err)))))))
 

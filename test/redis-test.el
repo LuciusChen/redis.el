@@ -133,16 +133,187 @@
           (should-not (redis-conn-closed conn)))
       (redis-disconnect conn))))
 
-(ert-deftest redis-test-connect-authenticates-and-selects-database ()
-  "Connection setup should issue AUTH before SELECT."
-  (let (calls conn)
+(ert-deftest redis-test-fragmented-response-scans-incrementally ()
+  "Fragmented input should resume from the last complete RESP token."
+  (let* ((buffer (generate-new-buffer " *redis-test-fragmented*"))
+         (process (make-pipe-process :name "redis-test-fragmented"
+                                     :buffer buffer :noquery t))
+         (conn (make-redis-conn :process process))
+         (chunks (list "bar\r\n")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (set-buffer-multibyte nil)
+            (insert "*2\r\n$3\r\nfoo\r\n$3\r\n"))
+          (process-put process 'redis-response-start
+                       (with-current-buffer buffer (point-min)))
+          (cl-letf (((symbol-function 'accept-process-output)
+                     (lambda (&rest _)
+                       (with-current-buffer buffer
+                         (goto-char (point-max))
+                         (insert (pop chunks)))
+                       t)))
+            (should (equal (redis--read-response conn) '("foo" "bar"))))
+          (should-not chunks)
+          (with-current-buffer buffer
+            (should (= (buffer-size) 0))))
+      (redis-disconnect conn))))
+
+(ert-deftest redis-test-incremental-line-scan-resumes-near-tail ()
+  "Incomplete RESP lines should not be rescanned from their prefix."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert "+partial")
+    (let ((state (redis--make-scan-state :pos (point-min))))
+      (should-not (redis--scan-available state))
+      (should (> (redis--scan-state-line-search state) (point-min)))
+      (goto-char (point-max))
+      (insert " response\r\n")
+      (should (= (redis--scan-available state) (point-max))))))
+
+(ert-deftest redis-test-quit-after-send-invalidates-connection ()
+  "A quit after command send must discard the ambiguous stream."
+  (let* ((buffer (generate-new-buffer " *redis-test-quit*"))
+         (process (make-pipe-process :name "redis-test-quit"
+                                     :buffer buffer :noquery t))
+         (conn (make-redis-conn :process process))
+         quit-seen)
+    (cl-letf (((symbol-function 'process-send-string) #'ignore)
+              ((symbol-function 'redis--read-response)
+               (lambda (_conn) (signal 'quit nil))))
+      (condition-case nil
+          (redis-command conn "PING")
+        (quit (setq quit-seen t))))
+    (should quit-seen)
+    (should (redis-conn-closed conn))
+    (should-not (redis-live-p conn))
+    (should-not (buffer-live-p buffer))))
+
+(ert-deftest redis-test-response-resource-limits ()
+  "RESP byte, bulk, element, and nesting limits should fail closed."
+  (let ((redis-max-response-bytes 4))
+    (should-error (redis-parse-response "+OK\r\n")
+                  :type 'redis-protocol-error))
+  (let ((redis-max-bulk-bytes 2))
+    (should-error (redis-parse-response "$3\r\nfoo\r\n")
+                  :type 'redis-protocol-error))
+  (let ((redis-max-elements 1))
+    (should-error (redis-parse-response "*2\r\n:1\r\n:2\r\n")
+                  :type 'redis-protocol-error))
+  (let ((redis-max-depth 1))
+    (should-error (redis-parse-response "*1\r\n*1\r\n+OK\r\n")
+                  :type 'redis-protocol-error))
+  (should (= (car (redis-parse-response ":9223372036854775807\r\n"))
+             9223372036854775807))
+  (should (= (car (redis-parse-response ":-9223372036854775808\r\n"))
+             -9223372036854775808))
+  (dolist (response '(":9223372036854775808\r\n"
+                      ":-9223372036854775809\r\n"
+                      ":000000000000000000001\r\n"
+                      "$000000000000000000001\r\nx\r\n"))
+    (should-error (redis-parse-response response)
+                  :type 'redis-protocol-error)))
+
+(ert-deftest redis-test-public-response-limit-allows-trailing-frame ()
+  "The public byte limit should apply to the first consumed response only."
+  (let ((redis-max-response-bytes 5))
+    (should (equal (redis-parse-response "+OK\r\n+NEXT\r\n")
+                   '("OK" . 5)))
+    (should-error (redis-parse-response "+HEY\r\n")
+                  :type 'redis-protocol-error)))
+
+(ert-deftest redis-test-element-budget-resets-between-public-parses ()
+  "Each public parse should receive an independent element budget."
+  (let ((redis-max-elements 1))
+    (should (equal (car (redis-parse-response "*1\r\n+OK\r\n"))
+                   '("OK")))
+    (should (equal (car (redis-parse-response "*1\r\n+OK\r\n"))
+                   '("OK")))))
+
+(ert-deftest redis-test-connect-is-bounded-and-cleans-up ()
+  "Connection setup should be asynchronous, bounded, and leak-free."
+  (let (created-process created-buffer nowait)
     (cl-letf (((symbol-function 'make-network-process)
                (lambda (&rest args)
+                 (setq nowait (plist-get args :nowait)
+                       created-buffer (plist-get args :buffer)
+                       created-process
+                       (make-pipe-process :name "redis-test-connect-timeout"
+                                          :buffer created-buffer :noquery t))))
+              ((symbol-function 'redis--wait-for-connect)
+               (lambda (_process)
+                 (signal 'redis-connection-error '("connect timeout")))))
+      (should-error (redis-connect '(:host "db" :port 6379))
+                    :type 'redis-connection-error))
+    (should nowait)
+    (should-not (process-live-p created-process))
+    (should-not (buffer-live-p created-buffer))))
+
+(ert-deftest redis-test-connect-wait-dispatches-global-process-events ()
+  "Asynchronous connect waits should not restrict event dispatch to the socket."
+  (let ((status 'connect)
+        accepted-process)
+    (cl-letf (((symbol-function 'process-status) (lambda (_process) status))
+              ((symbol-function 'redis--process-live-p)
+               (lambda (_process) (eq status 'open)))
+              ((symbol-function 'accept-process-output)
+               (lambda (process &rest _)
+                 (setq accepted-process process
+                       status 'open)
+                 t)))
+      (redis--wait-for-connect :process))
+    (should-not accepted-process)))
+
+(ert-deftest redis-test-connect-quit-cleans-up ()
+  "Quitting during connection setup should not leak transport resources."
+  (let (created-process created-buffer quit-seen)
+    (cl-letf (((symbol-function 'make-network-process)
+               (lambda (&rest args)
+                 (setq created-buffer (plist-get args :buffer)
+                       created-process
+                       (make-pipe-process :name "redis-test-connect-quit"
+                                          :buffer created-buffer :noquery t))))
+              ((symbol-function 'redis--wait-for-connect)
+               (lambda (_process) (signal 'quit nil))))
+      (condition-case nil
+          (redis-connect '(:host "db" :port 6379))
+        (quit (setq quit-seen t))))
+    (should quit-seen)
+    (should-not (process-live-p created-process))
+    (should-not (buffer-live-p created-buffer))))
+
+(ert-deftest redis-test-process-sentinel-does-not-pollute-wire-buffer ()
+  "A remote close should stay transport state, not become RESP payload."
+  (let* ((buffer (generate-new-buffer " *redis-test-sentinel*"))
+         (process (make-pipe-process :name "redis-test-sentinel"
+                                     :buffer buffer :noquery t
+                                     :sentinel #'redis--process-sentinel))
+         (conn (make-redis-conn :process process)))
+    (unwind-protect
+        (progn
+          (delete-process process)
+          (accept-process-output nil 0.01)
+          (with-current-buffer buffer
+            (should (= (buffer-size) 0)))
+          (should (process-get process 'redis-error))
+          (should-error (redis--read-response conn)
+                        :type 'redis-connection-error))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest redis-test-connect-authenticates-and-selects-database ()
+  "Connection setup should issue AUTH before SELECT."
+  (let (calls conn creation-sentinel-present installed-sentinels)
+    (cl-letf (((symbol-function 'make-network-process)
+               (lambda (&rest args)
+                 (setq creation-sentinel-present (plist-member args :sentinel))
                  (make-pipe-process :name "redis-test-connect"
                                     :buffer (plist-get args :buffer)
                                     :noquery t)))
               ((symbol-function 'redis-command)
-               (lambda (_conn command &rest arguments)
+               (lambda (redis-connection command &rest arguments)
+                 (push (process-sentinel
+                        (redis-conn-process redis-connection))
+                       installed-sentinels)
                  (push (cons command arguments) calls)
                  "OK")))
       (unwind-protect
@@ -150,6 +321,9 @@
                                       :user "app" :password "secret"
                                       :database 2)))
         (when conn (redis-disconnect conn))))
+    (should-not creation-sentinel-present)
+    (should (equal installed-sentinels
+                   '(redis--process-sentinel redis--process-sentinel)))
     (should (equal (nreverse calls)
                    '(("AUTH" "app" "secret") ("SELECT" 2))))))
 
