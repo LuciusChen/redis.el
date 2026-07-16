@@ -283,8 +283,8 @@
                        created-process
                        (make-pipe-process :name "redis-test-connect-quit"
                                           :buffer created-buffer :noquery t))))
-              ((symbol-function 'redis--wait-for-connect)
-               (lambda (_process) (signal 'quit nil))))
+              ((symbol-function 'redis--maybe-authenticate)
+               (lambda (&rest _args) (signal 'quit nil))))
       (condition-case nil
           (redis-connect '(:host "db" :port 6379))
         (quit (setq quit-seen t))))

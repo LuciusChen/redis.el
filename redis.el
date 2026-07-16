@@ -572,53 +572,43 @@ PARAMS is a plist supporting :host, :port, :user, :password, and :database."
          (buffer (redis--make-buffer host port))
          process
          conn)
-    (condition-case err
-        (progn
-          (setq process
-                (make-network-process
-                 :name (redis--buffer-name host port)
-                 :buffer buffer
-                 :host host
-                 :service port
-                 :nowait t
-                 :noquery t
-                 :coding 'binary))
-          (set-process-query-on-exit-flag process nil)
-          (set-process-coding-system process 'binary 'binary)
-          (redis--wait-for-connect process)
-          ;; Keep connection establishment separate from protocol handling:
-          ;; install the wire-safe sentinel before any Redis command is sent.
-          (set-process-sentinel process #'redis--process-sentinel)
-          (process-put process 'redis-response-start
-                       (with-current-buffer buffer (point-min)))
-          (setq conn (make-redis-conn
-                      :process process
-                      :host host
-                      :port port
-                      :database (plist-get params :database)
-                      :username (plist-get params :user)))
-          (redis--maybe-authenticate conn params)
-          (redis--maybe-select-database conn params)
-          conn)
-      (redis-error
-       (when conn (redis-disconnect conn))
-       (unless conn
-         (when (processp process) (delete-process process))
-         (when (buffer-live-p buffer) (kill-buffer buffer)))
-       (signal (car err) (cdr err)))
-      (quit
-       (when conn (redis-disconnect conn))
-       (unless conn
-         (when (processp process) (delete-process process))
-         (when (buffer-live-p buffer) (kill-buffer buffer)))
-       (signal (car err) (cdr err)))
-      (error
-       (when conn (redis-disconnect conn))
-       (unless conn
-         (when (processp process) (delete-process process))
-         (when (buffer-live-p buffer) (kill-buffer buffer)))
-       (signal 'redis-connection-error
-               (list (error-message-string err)))))))
+    (unwind-protect
+        (condition-case err
+            (progn
+              (setq process
+                    (make-network-process
+                     :name (redis--buffer-name host port)
+                     :buffer buffer
+                     :host host
+                     :service port
+                     :nowait t
+                     :noquery t
+                     :coding 'binary))
+              (set-process-query-on-exit-flag process nil)
+              (set-process-coding-system process 'binary 'binary)
+              (redis--wait-for-connect process)
+              ;; Keep connection establishment separate from protocol handling:
+              ;; install the wire-safe sentinel before any Redis command is sent.
+              (set-process-sentinel process #'redis--process-sentinel)
+              (process-put process 'redis-response-start
+                           (with-current-buffer buffer (point-min)))
+              (setq conn (make-redis-conn
+                          :process process
+                          :host host
+                          :port port
+                          :database (plist-get params :database)
+                          :username (plist-get params :user)))
+              (redis--maybe-authenticate conn params)
+              (redis--maybe-select-database conn params)
+              ;; Transfer transport ownership to the returned connection.
+              (prog1 conn (setq process nil buffer nil)))
+          (redis-error
+           (signal (car err) (cdr err)))
+          (error
+           (signal 'redis-connection-error
+                   (list (error-message-string err)))))
+      (when (processp process) (delete-process process))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (defun redis-disconnect (conn)
   "Close Redis connection CONN."
