@@ -54,8 +54,9 @@ Byte-compiling must produce zero warnings; delete the generated files so
 they cannot shadow the source in later runs:
 
 ```bash
-emacs -Q --batch -L . -f batch-byte-compile redis.el test/redis-test.el
-rm -f *.elc test/*.elc
+emacs -Q --batch --eval '(setq byte-compile-error-on-warn t)' \
+  -L . -f batch-byte-compile redis.el test/redis-test.el \
+  && rm -f *.elc test/*.elc
 ```
 
 ## Architecture
