@@ -530,25 +530,38 @@ unibyte byte strings."
   (when (redis-conn-busy conn)
     (signal 'redis-connection-error
             (list "Redis connection is already running a command")))
-  (let ((payload (apply #'redis-encode-command command arguments)))
+  (let ((payload (apply #'redis-encode-command command arguments))
+        completed)
     (setf (redis-conn-busy conn) t)
     (unwind-protect
         (condition-case err
-            (progn
-              (process-send-string (redis-conn-process conn) payload)
-              (redis--read-response conn))
+            ;; Bind throw-on-input to nil so `while-no-input', used by
+            ;; completion frameworks to abandon slow candidate lookups, cannot
+            ;; abort the exchange between send and reply.
+            (prog1 (let ((throw-on-input nil))
+                     (process-send-string (redis-conn-process conn) payload)
+                     (redis--read-response conn))
+              (setq completed t))
           ((redis-timeout-error redis-protocol-error redis-connection-error)
+           (setq completed t)
            (redis-disconnect conn)
            (signal (car err) (cdr err)))
           (redis-error
+           (setq completed t)
            (signal (car err) (cdr err)))
           (quit
+           (setq completed t)
            (redis-disconnect conn)
            (signal (car err) (cdr err)))
           (error
+           (setq completed t)
            (redis-disconnect conn)
            (signal 'redis-connection-error
                    (list (error-message-string err)))))
+      ;; RESP carries no request identifier, so an exchange abandoned by a
+      ;; nonlocal exit would hand its reply to the next caller.
+      (unless completed
+        (redis-disconnect conn))
       (setf (redis-conn-busy conn) nil))))
 
 (defun redis--maybe-authenticate (conn params)

@@ -199,6 +199,47 @@
     (should-not (redis-live-p conn))
     (should-not (buffer-live-p buffer))))
 
+(ert-deftest redis-test-throw-after-send-invalidates-connection ()
+  "A throw past the command must not leave the reply stream for the next caller.
+`while-no-input' throws rather than signals, so it escapes `condition-case'
+handlers that only cover errors and quit."
+  (let* ((buffer (generate-new-buffer " *redis-test-throw*"))
+         (process (make-pipe-process :name "redis-test-throw"
+                                     :buffer buffer :noquery t))
+         (conn (make-redis-conn :process process))
+         throw-seen)
+    (cl-letf (((symbol-function 'process-send-string) #'ignore)
+              ((symbol-function 'redis--read-response)
+               (lambda (_conn) (throw 'redis-test-tag 'interrupted))))
+      (should (eq (catch 'redis-test-tag
+                    (redis-command conn "PING"))
+                  'interrupted))
+      (setq throw-seen t))
+    (should throw-seen)
+    (should (redis-conn-closed conn))
+    (should-not (redis-live-p conn))
+    (should-not (buffer-live-p buffer))))
+
+(ert-deftest redis-test-command-blocks-input-throws ()
+  "Command exchange must run with `throw-on-input' disabled.
+Completion frameworks wrap candidate lookups in `while-no-input', which would
+otherwise abandon a reply mid-flight on every keystroke."
+  (let* ((buffer (generate-new-buffer " *redis-test-no-input*"))
+         (process (make-pipe-process :name "redis-test-no-input"
+                                     :buffer buffer :noquery t))
+         (conn (make-redis-conn :process process))
+         observed)
+    (unwind-protect
+        (cl-letf (((symbol-function 'process-send-string) #'ignore)
+                  ((symbol-function 'redis--read-response)
+                   (lambda (_conn)
+                     (setq observed throw-on-input)
+                     "PONG")))
+          (let ((throw-on-input 'outer-tag))
+            (should (equal (redis-command conn "PING") "PONG")))
+          (should-not observed))
+      (redis-disconnect conn))))
+
 (ert-deftest redis-test-response-resource-limits ()
   "RESP byte, bulk, element, and nesting limits should fail closed."
   (let ((redis-max-response-bytes 4))
