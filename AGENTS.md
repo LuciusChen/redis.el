@@ -29,6 +29,35 @@ adapter, read that caller's own guide as well.
   exact byte strings and assert distinguishable values.
 - Do not add silent fallbacks for unsupported Redis features.
 
+## Running Tests
+
+Unit tests use the same invocation as CI; `load-prefer-newer` keeps a stale
+`.elc` from shadowing edited sources:
+
+```bash
+emacs -Q --batch --eval '(setq load-prefer-newer t)' \
+  -L . -l ert -l test/redis-test.el \
+  --eval '(ert-run-tests-batch-and-exit)'
+```
+
+Live tests need a reachable Redis server and are opt-in through environment
+variables; `REDIS_TEST_HOST` and `REDIS_TEST_PORT` default to `127.0.0.1`
+and `6379`:
+
+```bash
+REDIS_TEST_LIVE=1 emacs -Q --batch --eval '(setq load-prefer-newer t)' \
+  -L . -l ert -l test/redis-test.el \
+  --eval '(ert-run-tests-batch-and-exit)'
+```
+
+Byte-compiling must produce zero warnings; delete the generated files so
+they cannot shadow the source in later runs:
+
+```bash
+emacs -Q --batch -L . -f batch-byte-compile redis.el test/redis-test.el
+rm -f *.elc test/*.elc
+```
+
 ## Architecture
 
 - Public symbols use the `redis-` prefix.
@@ -49,5 +78,5 @@ adapter, read that caller's own guide as well.
   must include SPDX license metadata.
 - Keep the MELPA checklist attribution in the main package file when AI tools
   materially assist the package:
-  `;; Assisted-by: OpenAI Codex:gpt-5.5`
+  `;; Assisted-by: OpenAI Codex:gpt-5.6-sol, Claude code:fable-5`
 - Last line: `;;; file.el ends here`
