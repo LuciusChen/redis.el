@@ -36,31 +36,37 @@
   (should-error (redis-parse-response "*1\r\n-ERR nested\r\n")
                 :type 'redis-error))
 
+(defmacro redis-test--with-pipe-conn (var &rest body)
+  "Run BODY with VAR bound to a `redis-conn' over a fresh pipe process.
+The process and its buffer are cleaned up even when an assertion fails,
+so a red test cannot leak them."
+  (declare (indent 1) (debug (symbolp body)))
+  (let ((buf (make-symbol "buffer"))
+        (proc (make-symbol "process")))
+    `(let* ((,buf (generate-new-buffer " *redis-test-conn*"))
+            (,proc (make-pipe-process :name "redis-test-conn"
+                                      :buffer ,buf :noquery t))
+            (,var (make-redis-conn :process ,proc)))
+       (unwind-protect
+           (progn ,@body)
+         (when (process-live-p ,proc)
+           (delete-process ,proc))
+         (when (buffer-live-p ,buf)
+           (kill-buffer ,buf))))))
+
 (ert-deftest redis-test-read-response-consumes-error-before-signaling ()
   "Connection reads should advance past Redis error replies."
-  (let* ((buffer (generate-new-buffer " *redis-test*"))
-         (process nil)
-         (conn nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer buffer
-            (set-buffer-multibyte nil)
-            (insert "-ERR bad\r\n+OK\r\n"))
-          (setq process (make-pipe-process
-                         :name "redis-test"
-                         :buffer buffer
-                         :noquery t))
-          (process-put process 'redis-response-start
-                       (with-current-buffer buffer (point-min)))
-          (setq conn (make-redis-conn :process process))
-          (should-error (redis--read-response conn) :type 'redis-error)
-          (should (equal (redis--read-response conn) "OK"))
-          (with-current-buffer buffer
-            (should (= (buffer-size) 0))))
-      (when (processp process)
-        (delete-process process))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
+  (redis-test--with-pipe-conn conn
+    (let ((buffer (process-buffer (redis-conn-process conn))))
+      (with-current-buffer buffer
+        (set-buffer-multibyte nil)
+        (insert "-ERR bad\r\n+OK\r\n"))
+      (process-put (redis-conn-process conn) 'redis-response-start
+                   (with-current-buffer buffer (point-min)))
+      (should-error (redis--read-response conn) :type 'redis-error)
+      (should (equal (redis--read-response conn) "OK"))
+      (with-current-buffer buffer
+        (should (= (buffer-size) 0))))))
 
 (ert-deftest redis-test-incomplete-response-signals-protocol-error ()
   "Public parsing should reject incomplete responses."
@@ -73,101 +79,105 @@
     (should-error (redis-parse-response response)
                   :type 'redis-protocol-error)))
 
-(ert-deftest redis-test-timeout-invalidates-connection ()
-  "A response timeout should close the connection before it can be reused."
-  (let* ((redis-response-timeout 0)
-         (buffer (generate-new-buffer " *redis-test-timeout*"))
-         (process (make-pipe-process :name "redis-test-timeout"
-                                     :buffer buffer :noquery t))
-         (conn (make-redis-conn :process process)))
-    (cl-letf (((symbol-function 'process-send-string) #'ignore))
-      (should-error (redis-command conn "PING")
-                    :type 'redis-timeout-error))
-    (should (redis-conn-closed conn))
-    (should-not (redis-live-p conn))
-    (should-not (buffer-live-p buffer))))
+(ert-deftest redis-test-abandoned-exchange-invalidates-connection ()
+  "Timeouts, quits, and throws mid-exchange must discard the stream.
+After a command is sent the reply's framing is ambiguous to the next
+caller, so every abandonment closes the connection; `while-no-input'
+throws rather than signals, which escapes handlers that only cover
+errors and quit."
+  (dolist (exit '(timeout quit throw))
+    (ert-info ((format "exit: %s" exit))
+      (redis-test--with-pipe-conn conn
+        (cl-letf (((symbol-function 'process-send-string) #'ignore)
+                  ((symbol-function 'redis--read-response)
+                   (pcase exit
+                     ;; The real read runs the timeout out against an
+                     ;; empty pipe.
+                     ('timeout (symbol-function 'redis--read-response))
+                     ('quit (lambda (_conn) (signal 'quit nil)))
+                     ('throw (lambda (_conn)
+                               (throw 'redis-test-tag 'interrupted)))))
+                  ((symbol-value 'redis-response-timeout)
+                   (if (eq exit 'timeout) 0 redis-response-timeout)))
+          (pcase exit
+            ('timeout
+             (should-error (redis-command conn "PING")
+                           :type 'redis-timeout-error))
+            ('quit
+             (let (caught)
+               (condition-case nil
+                   (redis-command conn "PING")
+                 (quit (setq caught t)))
+               (should caught)))
+            ('throw
+             (should (eq (catch 'redis-test-tag
+                           (redis-command conn "PING"))
+                         'interrupted)))))
+        (should (redis-conn-closed conn))
+        (should-not (redis-live-p conn))
+        (should-not (buffer-live-p (process-buffer (redis-conn-process conn))))))))
 
 (ert-deftest redis-test-protocol-error-invalidates-connection ()
   "A malformed server response should close the connection."
-  (let* ((buffer (generate-new-buffer " *redis-test-protocol-error*"))
-         (process (make-pipe-process :name "redis-test-protocol-error"
-                                     :buffer buffer :noquery t))
-         (conn (make-redis-conn :process process)))
-    (with-current-buffer buffer
+  (redis-test--with-pipe-conn conn
+    (with-current-buffer (process-buffer (redis-conn-process conn))
       (set-buffer-multibyte nil)
       (insert "?bad\r\n"))
     (cl-letf (((symbol-function 'process-send-string) #'ignore))
       (should-error (redis-command conn "PING")
                     :type 'redis-protocol-error))
     (should (redis-conn-closed conn))
-    (should-not (buffer-live-p buffer))))
+    (should-not (buffer-live-p (process-buffer (redis-conn-process conn))))))
 
 (ert-deftest redis-test-server-error-keeps-connection-live ()
   "A consumed Redis error reply should not invalidate the connection."
-  (let* ((buffer (generate-new-buffer " *redis-test-server-error*"))
-         (process (make-pipe-process :name "redis-test-server-error"
-                                     :buffer buffer :noquery t))
-         (conn (make-redis-conn :process process)))
-    (unwind-protect
-        (progn
-          (with-current-buffer buffer
-            (set-buffer-multibyte nil)
-            (insert "-ERR bad\r\n"))
-          (cl-letf (((symbol-function 'process-send-string) #'ignore))
-            (should-error (redis-command conn "PING") :type 'redis-error))
-          (should (redis-live-p conn))
-          (should-not (redis-conn-closed conn)))
-      (redis-disconnect conn))))
+  (redis-test--with-pipe-conn conn
+    (with-current-buffer (process-buffer (redis-conn-process conn))
+      (set-buffer-multibyte nil)
+      (insert "-ERR bad\r\n"))
+    (cl-letf (((symbol-function 'process-send-string) #'ignore))
+      (should-error (redis-command conn "PING") :type 'redis-error))
+    (should (redis-live-p conn))
+    (should-not (redis-conn-closed conn))))
 
 (ert-deftest redis-test-local-encoding-error-keeps-connection-live ()
   "Invalid local command arguments should not invalidate the connection."
-  (let* ((buffer (generate-new-buffer " *redis-test-encode-error*"))
-         (process (make-pipe-process :name "redis-test-encode-error"
-                                     :buffer buffer :noquery t))
-         (conn (make-redis-conn :process process)))
-    (unwind-protect
-        (progn
-          (should-error (redis-command conn "SET" '(unsupported))
-                        :type 'redis-protocol-error)
-          (should (redis-live-p conn))
-          (should-not (redis-conn-closed conn)))
-      (redis-disconnect conn))))
+  (redis-test--with-pipe-conn conn
+    (should-error (redis-command conn "SET" '(unsupported))
+                  :type 'redis-protocol-error)
+    (should (redis-live-p conn))
+    (should-not (redis-conn-closed conn))))
 
 (ert-deftest redis-test-fragmented-response-scans-incrementally ()
   "Fragmented input should resume from the last complete RESP token."
-  (let* ((buffer (generate-new-buffer " *redis-test-fragmented*"))
-         (process (make-pipe-process :name "redis-test-fragmented"
-                                     :buffer buffer :noquery t))
-         (conn (make-redis-conn :process process))
-         (chunks (list "bar\r\n"))
-         scan-states)
-    (unwind-protect
-        (progn
-          (with-current-buffer buffer
-            (set-buffer-multibyte nil)
-            (insert "*2\r\n$3\r\nfoo\r\n$3\r\n"))
-          (process-put process 'redis-response-start
-                       (with-current-buffer buffer (point-min)))
-          (let ((original-scan (symbol-function 'redis--scan-available)))
-            (cl-letf (((symbol-function 'redis--scan-available)
-                       (lambda (state)
-                         (push state scan-states)
-                         (funcall original-scan state)))
-                      ((symbol-function 'accept-process-output)
-                       (lambda (&rest _)
-                         (with-current-buffer buffer
-                           (goto-char (point-max))
-                           (insert (pop chunks)))
-                         t)))
-              (should (equal (redis--read-response conn) '("foo" "bar")))))
-          (should-not chunks)
-          (should (> (length scan-states) 1))
-          (let ((state (car scan-states)))
-            (dolist (seen scan-states)
-              (should (eq seen state))))
-          (with-current-buffer buffer
-            (should (= (buffer-size) 0))))
-      (redis-disconnect conn))))
+  (redis-test--with-pipe-conn conn
+    (let ((buffer (process-buffer (redis-conn-process conn)))
+          (chunks (list "bar\r\n"))
+          scan-states)
+      (with-current-buffer buffer
+        (set-buffer-multibyte nil)
+        (insert "*2\r\n$3\r\nfoo\r\n$3\r\n"))
+      (process-put (redis-conn-process conn) 'redis-response-start
+                   (with-current-buffer buffer (point-min)))
+      (let ((original-scan (symbol-function 'redis--scan-available)))
+        (cl-letf (((symbol-function 'redis--scan-available)
+                   (lambda (state)
+                     (push state scan-states)
+                     (funcall original-scan state)))
+                  ((symbol-function 'accept-process-output)
+                   (lambda (&rest _)
+                     (with-current-buffer buffer
+                       (goto-char (point-max))
+                       (insert (pop chunks)))
+                     t)))
+          (should (equal (redis--read-response conn) '("foo" "bar")))))
+      (should-not chunks)
+      (should (> (length scan-states) 1))
+      (let ((state (car scan-states)))
+        (dolist (seen scan-states)
+          (should (eq seen state))))
+      (with-current-buffer buffer
+        (should (= (buffer-size) 0))))))
 
 (ert-deftest redis-test-incremental-line-scan-resumes-near-tail ()
   "Incomplete RESP lines should not be rescanned from their prefix."
@@ -181,64 +191,20 @@
       (insert " response\r\n")
       (should (= (redis--scan-available state) (point-max))))))
 
-(ert-deftest redis-test-quit-after-send-invalidates-connection ()
-  "A quit after command send must discard the ambiguous stream."
-  (let* ((buffer (generate-new-buffer " *redis-test-quit*"))
-         (process (make-pipe-process :name "redis-test-quit"
-                                     :buffer buffer :noquery t))
-         (conn (make-redis-conn :process process))
-         quit-seen)
-    (cl-letf (((symbol-function 'process-send-string) #'ignore)
-              ((symbol-function 'redis--read-response)
-               (lambda (_conn) (signal 'quit nil))))
-      (condition-case nil
-          (redis-command conn "PING")
-        (quit (setq quit-seen t))))
-    (should quit-seen)
-    (should (redis-conn-closed conn))
-    (should-not (redis-live-p conn))
-    (should-not (buffer-live-p buffer))))
-
-(ert-deftest redis-test-throw-after-send-invalidates-connection ()
-  "A throw past the command must not leave the reply stream for the next caller.
-`while-no-input' throws rather than signals, so it escapes `condition-case'
-handlers that only cover errors and quit."
-  (let* ((buffer (generate-new-buffer " *redis-test-throw*"))
-         (process (make-pipe-process :name "redis-test-throw"
-                                     :buffer buffer :noquery t))
-         (conn (make-redis-conn :process process))
-         throw-seen)
-    (cl-letf (((symbol-function 'process-send-string) #'ignore)
-              ((symbol-function 'redis--read-response)
-               (lambda (_conn) (throw 'redis-test-tag 'interrupted))))
-      (should (eq (catch 'redis-test-tag
-                    (redis-command conn "PING"))
-                  'interrupted))
-      (setq throw-seen t))
-    (should throw-seen)
-    (should (redis-conn-closed conn))
-    (should-not (redis-live-p conn))
-    (should-not (buffer-live-p buffer))))
-
 (ert-deftest redis-test-command-blocks-input-throws ()
   "Command exchange must run with `throw-on-input' disabled.
 Completion frameworks wrap candidate lookups in `while-no-input', which would
 otherwise abandon a reply mid-flight on every keystroke."
-  (let* ((buffer (generate-new-buffer " *redis-test-no-input*"))
-         (process (make-pipe-process :name "redis-test-no-input"
-                                     :buffer buffer :noquery t))
-         (conn (make-redis-conn :process process))
-         observed)
-    (unwind-protect
-        (cl-letf (((symbol-function 'process-send-string) #'ignore)
-                  ((symbol-function 'redis--read-response)
-                   (lambda (_conn)
-                     (setq observed throw-on-input)
-                     "PONG")))
-          (let ((throw-on-input 'outer-tag))
-            (should (equal (redis-command conn "PING") "PONG")))
-          (should-not observed))
-      (redis-disconnect conn))))
+  (redis-test--with-pipe-conn conn
+    (let (observed)
+      (cl-letf (((symbol-function 'process-send-string) #'ignore)
+                ((symbol-function 'redis--read-response)
+                 (lambda (_conn)
+                   (setq observed throw-on-input)
+                   "PONG")))
+        (let ((throw-on-input 'outer-tag))
+          (should (equal (redis-command conn "PING") "PONG")))
+        (should-not observed)))))
 
 (ert-deftest redis-test-response-resource-limits ()
   "RESP byte, bulk, element, and nesting limits should fail closed."
