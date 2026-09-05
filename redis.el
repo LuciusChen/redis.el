@@ -266,7 +266,7 @@ If BYTES is nil, return nil."
 (defun redis--parse-array (bytes start depth)
   "Return (VALUE . NEXT) for a RESP array in BYTES from START.
 DEPTH is the number of containing arrays."
-  (let ((length-line (redis--parse-number-line bytes start)))
+  (let ((length-line (redis--parse-number-line bytes start)) values)
     (if (eq length-line redis--incomplete)
         redis--incomplete
       (pcase-let ((`(,size . ,pos) length-line))
@@ -289,9 +289,9 @@ DEPTH is the number of containing arrays."
                    for parsed = (redis--parse-response bytes pos (1+ depth))
                    when (eq parsed redis--incomplete)
                    return redis--incomplete
-                   collect (car parsed) into values
+                   do (push (car parsed) values)
                    do (setq pos (cdr parsed))
-                   finally return (cons values pos))))))))
+                   finally return (cons (nreverse values) pos))))))))
 
 (defun redis--parse-response (bytes &optional start depth)
   "Return (VALUE . NEXT) for one RESP response in BYTES.

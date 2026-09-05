@@ -344,6 +344,19 @@ otherwise abandon a reply mid-flight on every keystroke."
     (should (equal (nreverse calls)
                    '(("AUTH" "app" "secret") ("SELECT" 2))))))
 
+(ert-deftest redis-test-large-array-preserves-order-and-incomplete-state ()
+  "Large replies should preserve every element and support fragmented input."
+  (let* ((values (number-sequence 0 9999))
+         (bytes (concat "*10000\r\n"
+                        (mapconcat (lambda (n) (format ":%d\r\n" n))
+                                   values "")))
+         (redis--parse-element-count 0))
+    (should (eq (redis--parse-response (substring bytes 0 -1))
+                redis--incomplete))
+    (let ((redis--parse-element-count 0))
+      (should (equal (redis--parse-response bytes)
+                     (cons values (length bytes)))))))
+
 (ert-deftest redis-test-live-basic-commands ()
   "Basic command path should work against a live Redis server."
   :tags '(:redis-live)
@@ -355,13 +368,18 @@ otherwise abandon a reply mid-flight on every keystroke."
         (progn
           (should (redis-live-p conn))
           (should (equal (redis-command conn "PING") "PONG"))
+          (should (equal
+                   (redis-command conn "EVAL"
+                                  "local a={} for i=1,10000 do a[i]=i end return a"
+                                  0)
+                   (number-sequence 1 10000)))
           (should (equal (redis-command conn "SET" "redis-el:string" "hello") "OK"))
           (should (equal (redis-decode-string
                           (redis-command conn "GET" "redis-el:string"))
                          "hello"))
           (should (= (redis-command conn "HSET" "redis-el:hash" "field" "value") 1))
           (should (equal (mapcar #'redis-decode-string
-                                  (redis-command conn "HGETALL" "redis-el:hash"))
+                                 (redis-command conn "HGETALL" "redis-el:hash"))
                          '("field" "value")))
           (should (consp (redis-command conn "SCAN" 0 "MATCH" "redis-el:*"))))
       (redis-disconnect conn))))

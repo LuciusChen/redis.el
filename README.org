@@ -39,6 +39,8 @@ fragmented responses without repeatedly copying the whole buffer, disconnects
 after a post-send quit, and enforces configurable response, bulk, element, and
 nesting limits.
 
+Array replies are collected in linear time while preserving RESP order, incomplete-response handling, and the same element and nesting limits.
+
 Out of scope for now:
 
 - RESP3.
