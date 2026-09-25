@@ -20,22 +20,6 @@
                   "*3\r\n$3\r\nSET\r\n$4\r\ncity\r\n$6\r\n上海\r\n"
                   'utf-8 t))))
 
-(ert-deftest redis-test-parse-basic-response-types ()
-  "RESP parser should decode simple, integer, bulk, null, and array values."
-  (should (equal (redis-parse-response "+OK\r\n") '("OK" . 5)))
-  (should (equal (redis-parse-response ":42\r\n") '(42 . 5)))
-  (should (equal (redis-parse-response "$5\r\nhello\r\n") '("hello" . 11)))
-  (should (equal (redis-parse-response "$-1\r\n") '(nil . 5)))
-  (should (equal (redis-parse-response "*2\r\n$3\r\nfoo\r\n:7\r\n")
-                 '(("foo" 7) . 17))))
-
-(ert-deftest redis-test-error-response-signals-redis-error ()
-  "RESP error replies should not be ordinary values."
-  (should-error (redis-parse-response "-WRONGTYPE bad type\r\n")
-                :type 'redis-error)
-  (should-error (redis-parse-response "*1\r\n-ERR nested\r\n")
-                :type 'redis-error))
-
 (defmacro redis-test--with-pipe-conn (var &rest body)
   "Run BODY with VAR bound to a `redis-conn' over a fresh pipe process.
 The process and its buffer are cleaned up even when an assertion fails,
@@ -54,6 +38,42 @@ so a red test cannot leak them."
          (when (buffer-live-p ,buf)
            (kill-buffer ,buf))))))
 
+(defun redis-test--read (bytes)
+  "Return what `redis--read-response' reads once the server sent BYTES."
+  (redis-test--with-pipe-conn conn
+    (let ((buffer (process-buffer (redis-conn-process conn))))
+      (with-current-buffer buffer
+        (set-buffer-multibyte nil)
+        (insert bytes))
+      (process-put (redis-conn-process conn) 'redis-response-start
+                   (with-current-buffer buffer (point-min)))
+      (redis--read-response conn))))
+
+(ert-deftest redis-test-read-basic-response-types ()
+  "Reading should decode simple, integer, bulk, null, and array values."
+  (pcase-dolist (`(,bytes ,expected)
+                 '(("+OK\r\n" "OK")
+                   (":42\r\n" 42)
+                   ("$5\r\nhello\r\n" "hello")
+                   ("$0\r\n\r\n" "")
+                   ("$-1\r\n" nil)
+                   ("*-1\r\n" nil)
+                   ("*0\r\n" nil)
+                   ("*2\r\n$3\r\nfoo\r\n:7\r\n" ("foo" 7))
+                   ("*2\r\n*1\r\n+a\r\n$1\r\nb\r\n" (("a") "b"))))
+    (ert-info ((format "%S" bytes))
+      (should (equal (redis-test--read bytes) expected)))))
+
+(ert-deftest redis-test-error-response-signals-redis-error ()
+  "RESP error replies, nested ones included, should not be ordinary values."
+  (pcase-dolist (`(,bytes ,message)
+                 '(("-WRONGTYPE bad type\r\n" "WRONGTYPE bad type")
+                   ("*2\r\n+OK\r\n-ERR nested\r\n" "ERR nested")))
+    (ert-info ((format "%S" bytes))
+      (let ((err (should-error (redis-test--read bytes) :type 'redis-error)))
+        (should (eq (car err) 'redis-error))
+        (should (equal (cadr err) message))))))
+
 (ert-deftest redis-test-read-response-consumes-error-before-signaling ()
   "Connection reads should advance past Redis error replies."
   (redis-test--with-pipe-conn conn
@@ -68,16 +88,21 @@ so a red test cannot leak them."
       (with-current-buffer buffer
         (should (= (buffer-size) 0))))))
 
-(ert-deftest redis-test-incomplete-response-signals-protocol-error ()
-  "Public parsing should reject incomplete responses."
-  (should-error (redis-parse-response "$5\r\nhel")
-                :type 'redis-protocol-error))
+(ert-deftest redis-test-scan-waits-for-incomplete-responses ()
+  "Scanning should report no response until all of its bytes arrived."
+  (dolist (bytes '("$5\r\nhel" "$5\r\nhello\r" "*2\r\n:1\r\n" "+OK\r"))
+    (ert-info ((format "%S" bytes))
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert bytes)
+        (should-not (redis--scan-available
+                     (redis--make-scan-state :pos (point-min))))))))
 
 (ert-deftest redis-test-malformed-numbers-signal-protocol-error ()
   "RESP integers and lengths should use strict decimal syntax."
-  (dolist (response '(":wat\r\n" "$wat\r\n\r\n" "*wat\r\n"))
-    (should-error (redis-parse-response response)
-                  :type 'redis-protocol-error)))
+  (dolist (bytes '(":wat\r\n" "$wat\r\n\r\n" "*wat\r\n"))
+    (ert-info ((format "%S" bytes))
+      (should-error (redis-test--read bytes) :type 'redis-protocol-error))))
 
 (ert-deftest redis-test-abandoned-exchange-invalidates-connection ()
   "Timeouts, quits, and throws mid-exchange must discard the stream.
@@ -209,43 +234,27 @@ otherwise abandon a reply mid-flight on every keystroke."
 (ert-deftest redis-test-response-resource-limits ()
   "RESP byte, bulk, element, and nesting limits should fail closed."
   (let ((redis-max-response-bytes 4))
-    (should-error (redis-parse-response "+OK\r\n")
-                  :type 'redis-protocol-error))
+    (should-error (redis-test--read "+OK\r\n") :type 'redis-protocol-error))
   (let ((redis-max-bulk-bytes 2))
-    (should-error (redis-parse-response "$3\r\nfoo\r\n")
+    (should-error (redis-test--read "$3\r\nfoo\r\n")
                   :type 'redis-protocol-error))
   (let ((redis-max-elements 1))
-    (should-error (redis-parse-response "*2\r\n:1\r\n:2\r\n")
+    (should-error (redis-test--read "*2\r\n:1\r\n:2\r\n")
                   :type 'redis-protocol-error))
   (let ((redis-max-depth 1))
-    (should-error (redis-parse-response "*1\r\n*1\r\n+OK\r\n")
-                  :type 'redis-protocol-error))
-  (should (= (car (redis-parse-response ":9223372036854775807\r\n"))
+    (dolist (bytes '("*1\r\n*1\r\n+OK\r\n" "*1\r\n*0\r\n"))
+      (ert-info ((format "%S" bytes))
+        (should-error (redis-test--read bytes) :type 'redis-protocol-error))))
+  (should (= (redis-test--read ":9223372036854775807\r\n")
              9223372036854775807))
-  (should (= (car (redis-parse-response ":-9223372036854775808\r\n"))
+  (should (= (redis-test--read ":-9223372036854775808\r\n")
              -9223372036854775808))
-  (dolist (response '(":9223372036854775808\r\n"
-                      ":-9223372036854775809\r\n"
-                      ":000000000000000000001\r\n"
-                      "$000000000000000000001\r\nx\r\n"))
-    (should-error (redis-parse-response response)
-                  :type 'redis-protocol-error)))
-
-(ert-deftest redis-test-public-response-limit-allows-trailing-frame ()
-  "The public byte limit should apply to the first consumed response only."
-  (let ((redis-max-response-bytes 5))
-    (should (equal (redis-parse-response "+OK\r\n+NEXT\r\n")
-                   '("OK" . 5)))
-    (should-error (redis-parse-response "+HEY\r\n")
-                  :type 'redis-protocol-error)))
-
-(ert-deftest redis-test-element-budget-resets-between-public-parses ()
-  "Each public parse should receive an independent element budget."
-  (let ((redis-max-elements 1))
-    (should (equal (car (redis-parse-response "*1\r\n+OK\r\n"))
-                   '("OK")))
-    (should (equal (car (redis-parse-response "*1\r\n+OK\r\n"))
-                   '("OK")))))
+  (dolist (bytes '(":9223372036854775808\r\n"
+                   ":-9223372036854775809\r\n"
+                   ":000000000000000000001\r\n"
+                   "$000000000000000000001\r\nx\r\n"))
+    (ert-info ((format "%S" bytes))
+      (should-error (redis-test--read bytes) :type 'redis-protocol-error))))
 
 (ert-deftest redis-test-connect-is-bounded-and-cleans-up ()
   "Connection setup should be asynchronous, bounded, and leak-free."
@@ -345,17 +354,17 @@ otherwise abandon a reply mid-flight on every keystroke."
                    '(("AUTH" "app" "secret") ("SELECT" 2))))))
 
 (ert-deftest redis-test-large-array-preserves-order-and-incomplete-state ()
-  "Large replies should preserve every element and support fragmented input."
+  "Large replies should preserve every element and wait for a missing byte."
   (let* ((values (number-sequence 0 9999))
          (bytes (concat "*10000\r\n"
                         (mapconcat (lambda (n) (format ":%d\r\n" n))
-                                   values "")))
-         (redis--parse-element-count 0))
-    (should (eq (redis--parse-response (substring bytes 0 -1))
-                redis--incomplete))
-    (let ((redis--parse-element-count 0))
-      (should (equal (redis--parse-response bytes)
-                     (cons values (length bytes)))))))
+                                   values ""))))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert (substring bytes 0 -1))
+      (should-not (redis--scan-available
+                   (redis--make-scan-state :pos (point-min)))))
+    (should (equal (redis-test--read bytes) values))))
 
 (ert-deftest redis-test-live-basic-commands ()
   "Basic command path should work against a live Redis server."
