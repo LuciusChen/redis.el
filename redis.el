@@ -88,7 +88,6 @@
   host
   port
   database
-  username
   closed
   busy)
 
@@ -399,20 +398,14 @@ unibyte byte strings."
                      (process-send-string (redis-conn-process conn) payload)
                      (redis--read-response conn))
               (setq completed t))
+          ;; Transport failures are also `redis-error's; keep them from
+          ;; completing the exchange, so the unwind closes the connection.
           ((redis-timeout-error redis-protocol-error redis-connection-error)
-           (setq completed t)
-           (redis-disconnect conn)
            (signal (car err) (cdr err)))
           (redis-error
            (setq completed t)
            (signal (car err) (cdr err)))
-          (quit
-           (setq completed t)
-           (redis-disconnect conn)
-           (signal (car err) (cdr err)))
           (error
-           (setq completed t)
-           (redis-disconnect conn)
            (signal 'redis-connection-error
                    (list (error-message-string err)))))
       ;; RESP carries no request identifier, so an exchange abandoned by a
@@ -431,8 +424,7 @@ unibyte byte strings."
 (defun redis--maybe-select-database (conn params)
   "Select the Redis logical database from PARAMS on CONN when present."
   (when-let* ((database (plist-get params :database)))
-    (redis-command conn "SELECT" database)
-    (setf (redis-conn-database conn) database)))
+    (redis-command conn "SELECT" database)))
 
 (defun redis-connect (params)
   "Connect to Redis using PARAMS and return a `redis-conn'.
@@ -466,8 +458,7 @@ PARAMS is a plist supporting :host, :port, :user, :password, and :database."
                           :process process
                           :host host
                           :port port
-                          :database (plist-get params :database)
-                          :username (plist-get params :user)))
+                          :database (plist-get params :database)))
               (redis--maybe-authenticate conn params)
               (redis--maybe-select-database conn params)
               ;; Transfer transport ownership to the returned connection.
