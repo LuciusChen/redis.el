@@ -10,6 +10,7 @@ adapter, read that caller's own guide as well.
 
 - Keep this package protocol-only.  Do not add UI, query-console, grid
   rendering, object browsers, or Clutch-specific behavior.
+- Target Emacs 29.1+, as `Package-Requires` in `redis.el` declares.
 - Keep the first supported surface intentionally small: RESP2, one TCP
   connection, one command/response at a time, AUTH, SELECT, and structured Redis
   errors.
@@ -50,8 +51,9 @@ REDIS_TEST_LIVE=1 emacs -Q --batch --eval '(setq load-prefer-newer t)' \
   --eval '(ert-run-tests-batch-and-exit)'
 ```
 
-Byte-compiling must produce zero warnings; delete the generated files so
-they cannot shadow the source in later runs:
+CI runs only the unit suite, on Emacs 29.1, so byte-compile locally before
+committing.  Byte-compiling must produce zero warnings; delete the generated
+files so they cannot shadow the source in later runs:
 
 ```bash
 emacs -Q --batch --eval '(setq byte-compile-error-on-warn t)' \
@@ -81,3 +83,15 @@ emacs -Q --batch --eval '(setq byte-compile-error-on-warn t)' \
   materially assist the package:
   `;; Assisted-by: OpenAI Codex:gpt-5.6-sol, Claude code:fable-5`
 - Last line: `;;; file.el ends here`
+
+## Releases
+
+- Record user-visible changes in `CHANGELOG.md` under `Unreleased` in the same
+  change; pure test or internal cleanup needs no entry.
+- Only a release changes `;; Version:` in `redis.el`, moves the `Unreleased`
+  entries under the new version, and is tagged `vX.Y.Z`.  Keep
+  version-specific prose out of `README.org`.
+- redis.el has not been released: no version has been tagged, and the MELPA
+  package named `redis` is a different library (emacs-pe/redis.el), so callers
+  such as Clutch install this one from GitHub.  Publishing it on MELPA needs a
+  package name that does not collide.
