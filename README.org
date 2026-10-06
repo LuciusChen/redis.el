@@ -27,7 +27,8 @@ Current scope:
 - One command at a time per connection.
 - TCP connections.
 - AUTH password and AUTH username/password.
-- SELECT by logical database number.
+- SELECT by logical database number; =redis-conn-database= follows a SELECT
+  the server accepts.
 - Structured =redis-error=, =redis-protocol-error=, =redis-timeout-error=, and
   =redis-connection-error= conditions.
 - Response timeouts, malformed protocol replies, transport failures, and

@@ -4,6 +4,10 @@ Notable user-visible changes are recorded here.
 
 ## Unreleased
 
+### Fixed
+
+- A `SELECT` that the server accepts makes its database the connection's, which `redis-conn-database` returns. The connection kept the database it was opened with, so a caller showing it went on showing that one.
+
 ## 0.1.1 - 2026-07-15
 
 ### Changed

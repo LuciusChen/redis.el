@@ -165,6 +165,26 @@ errors and quit."
     (should (redis-live-p conn))
     (should-not (redis-conn-closed conn))))
 
+(ert-deftest redis-test-select-records-the-database-it-switches-to ()
+  "A SELECT the server accepts should make its argument CONN's database.
+CONN kept the database it was opened with, so a caller reading it went on
+showing that database after a SELECT moved the connection.  A refused
+SELECT, or one that MULTI only queues, leaves it."
+  (pcase-dolist (`(,reply ,database)
+                 '(("+OK\r\n" "1")
+                   ("-ERR DB index is out of range\r\n" 0)
+                   ("+QUEUED\r\n" 0)))
+    (ert-info (reply)
+      (redis-test--with-pipe-conn conn
+        (setf (redis-conn-database conn) 0)
+        (with-current-buffer (process-buffer (redis-conn-process conn))
+          (set-buffer-multibyte nil)
+          (insert reply))
+        (cl-letf (((symbol-function 'process-send-string) #'ignore))
+          (ignore-error redis-error
+            (redis-command conn "select" "1")))
+        (should (equal (redis-conn-database conn) database))))))
+
 (ert-deftest redis-test-local-encoding-error-keeps-connection-live ()
   "Invalid local command arguments should not invalidate the connection."
   (redis-test--with-pipe-conn conn
