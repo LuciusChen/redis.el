@@ -381,7 +381,8 @@ Return the absolute end position when one complete response is available."
 (defun redis-command (conn command &rest arguments)
   "Send COMMAND with ARGUMENTS on CONN and return the Redis response.
 Redis error responses signal `redis-error'.  Bulk strings are returned as
-unibyte byte strings."
+unibyte byte strings.  A SELECT that the server accepts makes its
+argument CONN's database, which `redis-conn-database' returns."
   (redis--ensure-live conn)
   (when (redis-conn-busy conn)
     (signal 'redis-connection-error
@@ -394,10 +395,17 @@ unibyte byte strings."
             ;; Bind throw-on-input to nil so `while-no-input', used by
             ;; completion frameworks to abandon slow candidate lookups, cannot
             ;; abort the exchange between send and reply.
-            (prog1 (let ((throw-on-input nil))
-                     (process-send-string (redis-conn-process conn) payload)
-                     (redis--read-response conn))
-              (setq completed t))
+            (let ((response (let ((throw-on-input nil))
+                              (process-send-string (redis-conn-process conn)
+                                                   payload)
+                              (redis--read-response conn))))
+              (setq completed t)
+              ;; Inside MULTI the server only queues SELECT and says QUEUED.
+              (when (and (string-equal-ignore-case (format "%s" command)
+                                                   "SELECT")
+                         (equal response "OK"))
+                (setf (redis-conn-database conn) (car arguments)))
+              response)
           ;; Transport failures are also `redis-error's; keep them from
           ;; completing the exchange, so the unwind closes the connection.
           ((redis-timeout-error redis-protocol-error redis-connection-error)
