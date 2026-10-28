@@ -47,3 +47,7 @@ Out of scope for now:
 - Pipelining.
 - Transactions.
 - Stream consumer workflows.
+
+* License
+
+redis.el is released under the GNU General Public License, version 3 or later.  See [[file:LICENSE][LICENSE]].
