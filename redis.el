@@ -465,8 +465,7 @@ PARAMS is a plist supporting :host, :port, :user, :password, and :database."
               (setq conn (make-redis-conn
                           :process process
                           :host host
-                          :port port
-                          :database (plist-get params :database)))
+                          :port port))
               (redis--maybe-authenticate conn params)
               (redis--maybe-select-database conn params)
               ;; Transfer transport ownership to the returned connection.
