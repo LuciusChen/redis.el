@@ -27,15 +27,12 @@ Current scope:
 - One command at a time per connection.
 - TCP connections.
 - AUTH password and AUTH username/password.
-- SELECT by logical database number; =redis-conn-database= follows a SELECT
-  the server accepts.
+- SELECT by logical database number. A direct =SELECT= that returns =OK= updates =redis-conn-database=.
 - Structured =redis-error=, =redis-protocol-error=, =redis-timeout-error=, and
   =redis-connection-error= conditions.
 - Response timeouts, malformed protocol replies, transport failures, and
   commands abandoned mid-exchange (a quit or a =while-no-input= throw) close
   the connection so a delayed reply cannot be mistaken for a later command.
-
-Array replies are collected in linear time while preserving RESP order, incomplete-response handling, and the same element and nesting limits.
 
 Out of scope for now:
 
